@@ -35,7 +35,7 @@ By default, it processes the `./music` folder and copies files into `./organized
 Simply run:
 
 ```bash
-node index.js
+npm start
 ```
 
 
