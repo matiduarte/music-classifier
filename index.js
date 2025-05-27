@@ -1,101 +1,103 @@
 #!/usr/bin/env node
 
 import fs from 'fs/promises';
-import path from 'path';
+import path, { dirname } from 'path';
 import { parseFile } from 'music-metadata';
+import { fileURLToPath } from 'url';
 import cliProgress from 'cli-progress';
+import pLimit from 'p-limit';
 
-const supportedExtensions = ['.mp3', '.aiff', '.aif', '.flac', '.wav', '.m4a', '.ogg', '.opus'];
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
 
-const sourceDir = path.join(process.cwd(), 'music');
-const destDir = path.join(process.cwd(), 'organized-by-genre');
+const SUPPORTED_EXTENSIONS = ['.mp3', '.aiff', '.flac', '.wav', '.ogg'];
 
-async function ensureDir(dir) {
-    try {
-        await fs.mkdir(dir, { recursive: true });
-    } catch (err) {
-        if (err.code !== 'EEXIST') throw err;
-    }
-}
+const args = process.argv.slice(2);
+const sourceDir = args.find(arg => arg.startsWith('--source='))?.split('=')[1] || path.join(__dirname, 'music');
+const outputDir = args.find(arg => arg.startsWith('--output='))?.split('=')[1] || path.join(__dirname, 'organized-by-genre');
+const concurrency = parseInt(args.find(arg => arg.startsWith('--concurrency='))?.split('=')[1]) || 20;
 
-async function scanDirectory(dir) {
+async function getAllAudioFiles(dir) {
+    let results = [];
     const entries = await fs.readdir(dir, { withFileTypes: true });
-    const files = [];
 
     for (const entry of entries) {
         const fullPath = path.join(dir, entry.name);
         if (entry.isDirectory()) {
-            const nestedFiles = await scanDirectory(fullPath);
-            files.push(...nestedFiles);
-        } else if (entry.isFile()) {
-            if (supportedExtensions.includes(path.extname(entry.name).toLowerCase())) {
-                files.push(fullPath);
-            }
+            results = results.concat(await getAllAudioFiles(fullPath));
+        } else if (SUPPORTED_EXTENSIONS.includes(path.extname(entry.name).toLowerCase())) {
+            results.push(fullPath);
         }
     }
-
-    return files;
+    return results;
 }
 
-async function organizeFile(file, progressBar) {
+async function processFile(filePath) {
     try {
-        const metadata = await parseFile(file);
-        const genreArray = metadata.common.genre || [];
-        const genre = genreArray.length > 0 ? genreArray[0] : 'Unknown';
+        const metadata = await parseFile(filePath);
+        const genre = (metadata.common.genre || ['Unknown'])[0];
+        const safeGenre = genre.replace(/[<>:"/\\|?*]/g, '_');
+        const destinationDir = path.join(outputDir, safeGenre);
+        await fs.mkdir(destinationDir, { recursive: true });
 
-        const sanitizedGenre = genre.replace(/[<>:"\/\\|?*\x00-\x1F]/g, '').trim() || 'Unknown';
-        const genreFolder = path.join(destDir, sanitizedGenre);
-        await ensureDir(genreFolder);
+        const destinationPath = path.join(destinationDir, path.basename(filePath));
 
-        const fileName = path.basename(file);
-        const destPath = path.join(genreFolder, fileName);
+        // Skip if file already exists to save time
+        try {
+            await fs.access(destinationPath);
+            // File exists, skip copying/moving
+            return `Skipped existing: ${path.basename(filePath)}`;
+        } catch {
+            // File doesn't exist, proceed
+        }
 
-        await fs.copyFile(file, destPath);
+        await fs.copyFile(filePath, destinationPath);
+        return `Copied: ${path.basename(filePath)} → ${safeGenre}`;
+
     } catch (err) {
-        console.error(`Failed to process "${file}": ${err.message}`);
-    } finally {
-        progressBar.increment();
+        return `Error: ${path.basename(filePath)} - ${err.message}`;
     }
 }
 
-async function main() {
-    await ensureDir(destDir);
-
-    console.log(`📁 Scanning directory: ${sourceDir}`);
-    const files = await scanDirectory(sourceDir);
-
-    console.log(`🎧 Found ${files.length} supported audio files.`);
-
-    const progressBar = new cliProgress.SingleBar({
-        format: 'Progress |{bar}| {percentage}% || {value}/{total} files',
+async function processFiles(files) {
+    const bar = new cliProgress.SingleBar({
+        format: '🎶 Processing |{bar}| {percentage}% || {value}/{total} files',
         barCompleteChar: '█',
         barIncompleteChar: '░',
-        hideCursor: true,
+        hideCursor: true
     });
+    bar.start(files.length, 0);
 
-    progressBar.start(files.length, 0);
+    const limit = pLimit(concurrency);
 
-    const concurrency = 5;
-    let index = 0;
+    let processedCount = 0;
 
-    async function worker() {
-        while (index < files.length) {
-            const currentIndex = index++;
-            await organizeFile(files[currentIndex], progressBar);
+    const promises = files.map(file => limit(async () => {
+        const result = await processFile(file);
+        processedCount++;
+        bar.update(processedCount);
+        if (result.startsWith('Error')) {
+            console.error(`❌ ${result}`);
         }
-    }
+    }));
 
-    const workers = [];
-    for (let i = 0; i < concurrency; i++) {
-        workers.push(worker());
-    }
-
-    await Promise.all(workers);
-    progressBar.stop();
-
-    console.log('✅ Organization complete!');
+    await Promise.all(promises);
+    bar.stop();
+    console.log('✅ Done processing all files.');
 }
 
-main().catch(err => {
-    console.error('🚨 Unexpected error:', err);
-});
+(async () => {
+    try {
+        console.log(`📁 Scanning: ${sourceDir}`);
+        const files = await getAllAudioFiles(sourceDir);
+        if (!files.length) {
+            console.log('⚠️ No supported audio files found.');
+            return;
+        }
+        console.log(`🎧 Found ${files.length} supported audio files.`);
+        await processFiles(files);
+
+    } catch (err) {
+        console.error(`💥 Error: ${err.message}`);
+    }
+})();
