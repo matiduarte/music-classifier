@@ -1,81 +1,101 @@
-import fs from 'fs';
+#!/usr/bin/env node
+
+import fs from 'fs/promises';
 import path from 'path';
-import { fileURLToPath } from 'url';
 import { parseFile } from 'music-metadata';
+import cliProgress from 'cli-progress';
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+const supportedExtensions = ['.mp3', '.aiff', '.aif', '.flac', '.wav', '.m4a', '.ogg', '.opus'];
 
-const SUPPORTED_EXTENSIONS = ['.mp3', '.aiff', '.aif'];
-const DESTINATION_ROOT = path.join(__dirname, 'organized-by-genre');
+const sourceDir = path.join(process.cwd(), 'music');
+const destDir = path.join(process.cwd(), 'organized-by-genre');
 
-function sanitize(name) {
-    return name.replace(/[^a-z0-9-_ ]/gi, '_');
-}
-
-async function readMetadata(filePath) {
+async function ensureDir(dir) {
     try {
-        const metadata = await parseFile(filePath);
-        const common = metadata.common;
-        const duration = metadata.format.duration;
-        return {
-            file: path.basename(filePath),
-            title: common.title || '',
-            artist: common.artist || '',
-            album: common.album || '',
-            genre: (common.genre && common.genre[0]) || 'Unknown',
-            durationSeconds: duration ? Math.round(duration) : null,
-        };
+        await fs.mkdir(dir, { recursive: true });
     } catch (err) {
-        console.error(`[Error] ${filePath}:`, err.message);
-        return null;
+        if (err.code !== 'EEXIST') throw err;
     }
 }
 
-async function moveFileToGenreFolder(filePath, genre) {
-    const genreDir = path.join(DESTINATION_ROOT, sanitize(genre));
-    fs.mkdirSync(genreDir, { recursive: true });
+async function scanDirectory(dir) {
+    const entries = await fs.readdir(dir, { withFileTypes: true });
+    const files = [];
 
-    const destPath = path.join(genreDir, path.basename(filePath));
-
-    try {
-        fs.copyFileSync(filePath, destPath);
-        console.log(`✅ Copied to ${genreDir}`);
-    } catch (err) {
-        console.error(`❌ Error copying ${filePath} → ${destPath}: ${err.message}`);
-    }
-}
-
-async function readDirectory(directory) {
-    const files = fs.readdirSync(directory);
-
-    // Map all files/folders to promises
-    const processingTasks = files.map(async (file) => {
-        const fullPath = path.join(directory, file);
-        const stat = fs.statSync(fullPath);
-
-        if (stat.isDirectory()) {
-            // Process directories sequentially (await)
-            await readDirectory(fullPath);
-        } else if (SUPPORTED_EXTENSIONS.includes(path.extname(file).toLowerCase())) {
-            const metadata = await readMetadata(fullPath);
-            if (metadata) {
-                console.log(`🎵 ${metadata.title} (${metadata.genre})`);
-                await moveFileToGenreFolder(fullPath, metadata.genre);
+    for (const entry of entries) {
+        const fullPath = path.join(dir, entry.name);
+        if (entry.isDirectory()) {
+            const nestedFiles = await scanDirectory(fullPath);
+            files.push(...nestedFiles);
+        } else if (entry.isFile()) {
+            if (supportedExtensions.includes(path.extname(entry.name).toLowerCase())) {
+                files.push(fullPath);
             }
         }
-    });
+    }
 
-    // Wait for all files in this directory to finish processing in parallel
-    await Promise.all(processingTasks);
+    return files;
 }
 
-// Change this to your music source directory or leave it as default "./music"
-const sourceDir = process.argv[2] || path.join(__dirname, 'music');
+async function organizeFile(file, progressBar) {
+    try {
+        const metadata = await parseFile(file);
+        const genreArray = metadata.common.genre || [];
+        const genre = genreArray.length > 0 ? genreArray[0] : 'Unknown';
 
-console.log(`Processing music files from: ${sourceDir}`);
-console.log(`Organizing into: ${DESTINATION_ROOT}`);
+        const sanitizedGenre = genre.replace(/[<>:"\/\\|?*\x00-\x1F]/g, '').trim() || 'Unknown';
+        const genreFolder = path.join(destDir, sanitizedGenre);
+        await ensureDir(genreFolder);
 
-await readDirectory(sourceDir);
+        const fileName = path.basename(file);
+        const destPath = path.join(genreFolder, fileName);
 
-console.log('All done!');
+        await fs.copyFile(file, destPath);
+    } catch (err) {
+        console.error(`Failed to process "${file}": ${err.message}`);
+    } finally {
+        progressBar.increment();
+    }
+}
+
+async function main() {
+    await ensureDir(destDir);
+
+    console.log(`📁 Scanning directory: ${sourceDir}`);
+    const files = await scanDirectory(sourceDir);
+
+    console.log(`🎧 Found ${files.length} supported audio files.`);
+
+    const progressBar = new cliProgress.SingleBar({
+        format: 'Progress |{bar}| {percentage}% || {value}/{total} files',
+        barCompleteChar: '█',
+        barIncompleteChar: '░',
+        hideCursor: true,
+    });
+
+    progressBar.start(files.length, 0);
+
+    const concurrency = 5;
+    let index = 0;
+
+    async function worker() {
+        while (index < files.length) {
+            const currentIndex = index++;
+            await organizeFile(files[currentIndex], progressBar);
+        }
+    }
+
+    const workers = [];
+    for (let i = 0; i < concurrency; i++) {
+        workers.push(worker());
+    }
+
+    await Promise.all(workers);
+    progressBar.stop();
+
+    console.log('✅ Organization complete!');
+}
+
+main().catch(err => {
+    console.error('🚨 Unexpected error:', err);
+});
